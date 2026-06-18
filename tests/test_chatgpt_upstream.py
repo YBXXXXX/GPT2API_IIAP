@@ -107,12 +107,7 @@ def test_send_conversation_uses_multimodal_payload_for_attachment() -> None:
     assert conv_id == "conv-123"
     payload = session.posts[-1][1]["json"]
     message = payload["messages"][0]
-    assert message["content"]["content_type"] == "multimodal_text"
-    parts = message["content"]["parts"]
-    image_part = next(p for p in parts if isinstance(p, dict))
-    assert image_part["content_type"] == "image_asset_pointer"
-    assert image_part["asset_pointer"] == "file-service://file-123"
-    assert image_part["size_bytes"] == 11
-    assert "add sunglasses" in parts
+    assert message["content"] == {"content_type": "multimodal_text", "parts": ["add sunglasses"]}
     assert message["metadata"]["attachments"][0]["id"] == "file-123"
     assert message["metadata"]["attachments"][0]["mime_type"] == "image/png"
+    assert message["metadata"]["attachments"][0]["assetPointer"] == "file-service://file-123"

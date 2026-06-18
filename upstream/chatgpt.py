@@ -472,13 +472,7 @@ class ChatgptUpstreamClient:
             "screen_width": 1200 + (seed % 1000),
         }
         if attachment:
-            image_part = {
-                "content_type": "image_asset_pointer",
-                "asset_pointer": attachment["assetPointer"],
-                "size_bytes": attachment["size"],
-                "metadata": {},
-            }
-            msg_content = {"content_type": "multimodal_text", "parts": [image_part, prompt]}
+            msg_content = {"content_type": "multimodal_text", "parts": [prompt]}
             msg_metadata = {
                 "attachments": [
                     {
