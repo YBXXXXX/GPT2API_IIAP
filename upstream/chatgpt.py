@@ -8,7 +8,6 @@ import base64
 import hashlib
 import json
 import random
-import re
 import time
 import uuid
 from typing import Any
@@ -58,7 +57,9 @@ class ChatgptUpstreamClient:
         mime_type: str,
     ) -> ChatgptImageResult:
         """Executes one image-edit request against ChatGPT Web."""
-        raise NotImplementedError("edit_image not yet implemented")
+        return await asyncio.get_running_loop().run_in_executor(
+            None, self._sync_edit_image, account, prompt, requested_model, image_data, file_name, mime_type
+        )
 
     async def complete_text(
         self, account: AccountRecord, prompt: str, requested_model: str
@@ -175,9 +176,134 @@ class ChatgptUpstreamClient:
             resolved_model=requested_model,
         )
 
+    def _sync_edit_image(
+        self,
+        account: AccountRecord,
+        prompt: str,
+        requested_model: str,
+        image_data: bytes,
+        file_name: str,
+        mime_type: str,
+    ) -> ChatgptImageResult:
+        """Sync version: upload input image then run the standard generation flow."""
+        session, headers = self._build_session_and_headers(account)
+
+        scripts, build_id = self._bootstrap(session, headers)
+
+        device_id = str(uuid.uuid4())
+        req_headers = {
+            **headers,
+            "content-type": "application/json",
+            "oai-device-id": device_id,
+        }
+
+        chat_token, pow_info = self._chat_requirements(session, req_headers)
+
+        proof_token = None
+        if pow_info.get("required"):
+            proof_token = self._generate_proof_token(
+                pow_info.get("seed", ""),
+                pow_info.get("difficulty", ""),
+                scripts,
+                build_id,
+            )
+
+        attachment = self._upload_image_for_edit(session, req_headers, image_data, file_name, mime_type)
+
+        conv_id = self._send_conversation(
+            session, req_headers, chat_token, proof_token, prompt, requested_model, device_id,
+            attachment=attachment,
+        )
+
+        file_ids = self._poll_for_image_ids(session, req_headers, conv_id)
+
+        if not file_ids:
+            raise RuntimeError("no file IDs found after polling")
+
+        images: list[GeneratedImageItem] = []
+        for fid in set(file_ids):
+            img_bytes = self._download_image(session, req_headers, conv_id, fid)
+            if img_bytes:
+                b64 = base64.b64encode(img_bytes).decode()
+                images.append(GeneratedImageItem(b64_json=b64, revised_prompt=prompt))
+
+        if not images:
+            raise RuntimeError("failed to download any images")
+
+        return ChatgptImageResult(
+            created=int(time.time()),
+            data=images,
+            resolved_model=requested_model,
+        )
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
+
+    def _upload_image_for_edit(
+        self,
+        session: curl_requests.Session,
+        headers: dict[str, str],
+        image_data: bytes,
+        file_name: str,
+        mime_type: str,
+    ) -> dict[str, Any]:
+        """Upload an image to ChatGPT Web and return a normalized attachment dict."""
+        upload_headers = {k: v for k, v in headers.items() if k != "content-type"}
+
+        # Step 1: request an upload slot
+        create_resp = session.post(
+            f"{self.base_url}/backend-api/files",
+            headers=upload_headers,
+            json={
+                "file_name": file_name,
+                "file_size": len(image_data),
+                "mime_type": mime_type,
+                "use_case": "multimodal",
+            },
+            timeout=30,
+        )
+        if create_resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"image upload slot request failed: HTTP {create_resp.status_code} {create_resp.text[:400]}"
+            )
+        create_data = create_resp.json()
+        file_id = create_data.get("file_id") or create_data.get("id")
+        upload_url = create_data.get("upload_url")
+        if not file_id or not upload_url:
+            raise RuntimeError(f"image upload response missing file_id or upload_url: {create_data}")
+
+        # Step 2: PUT image bytes to the signed upload URL
+        put_resp = session.put(
+            upload_url,
+            data=image_data,
+            headers={"content-type": mime_type, "x-ms-blob-type": "BlockBlob"},
+            timeout=120,
+        )
+        if put_resp.status_code not in (200, 201, 204):
+            raise RuntimeError(
+                f"image PUT upload failed: HTTP {put_resp.status_code} {put_resp.text[:400]}"
+            )
+
+        # Step 3: mark upload complete
+        done_resp = session.post(
+            f"{self.base_url}/backend-api/files/{file_id}/uploaded",
+            headers=upload_headers,
+            json={},
+            timeout=30,
+        )
+        if done_resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"image upload completion failed: HTTP {done_resp.status_code} {done_resp.text[:400]}"
+            )
+
+        return {
+            "id": file_id,
+            "name": file_name,
+            "mimeType": mime_type,
+            "size": len(image_data),
+            "assetPointer": f"file-service://{file_id}",
+        }
 
     def _build_session_and_headers(self, account: AccountRecord) -> tuple[curl_requests.Session, dict[str, str]]:
         profile = account.browser_profile()
@@ -333,6 +459,7 @@ class ChatgptUpstreamClient:
         prompt: str,
         model: str,
         device_id: str,
+        attachment: dict[str, Any] | None = None,
     ) -> str:
         seed = random.randint(1, 100_000)
         contextual_info = {
@@ -344,14 +471,30 @@ class ChatgptUpstreamClient:
             "screen_height": 800 + (seed % 400),
             "screen_width": 1200 + (seed % 1000),
         }
+        if attachment:
+            msg_content = {"content_type": "multimodal_text", "parts": [prompt]}
+            msg_metadata = {
+                "attachments": [
+                    {
+                        "id": attachment["id"],
+                        "name": attachment["name"],
+                        "mimeType": attachment["mimeType"],
+                        "mime_type": attachment["mimeType"],
+                        "size": attachment["size"],
+                    }
+                ]
+            }
+        else:
+            msg_content = {"content_type": "text", "parts": [prompt]}
+            msg_metadata = {"attachments": []}
         payload = {
             "action": "next",
             "messages": [
                 {
                     "id": str(uuid.uuid4()),
                     "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": [prompt]},
-                    "metadata": {"attachments": []},
+                    "content": msg_content,
+                    "metadata": msg_metadata,
                 }
             ],
             "parent_message_id": str(uuid.uuid4()),
@@ -397,6 +540,7 @@ class ChatgptUpstreamClient:
             raise RuntimeError(f"conversation failed: HTTP {resp.status_code} {resp.text[:500]}")
 
         conv_id = ""
+        refusal_message = ""
         for line in resp.text.split("\n"):
             line = line.strip()
             if not line.startswith("data:"):
@@ -408,9 +552,14 @@ class ChatgptUpstreamClient:
                 event = json.loads(data)
                 if not conv_id:
                     conv_id = event.get("conversation_id", "")
+                text = self._extract_message_text(event.get("message") or {})
+                if text and self._looks_like_refusal(text):
+                    refusal_message = text
             except json.JSONDecodeError:
                 continue
 
+        if refusal_message:
+            raise RuntimeError(refusal_message)
         if not conv_id:
             raise RuntimeError("no conversation_id in SSE response")
         return conv_id
@@ -418,8 +567,10 @@ class ChatgptUpstreamClient:
     def _poll_for_image_ids(
         self, session: curl_requests.Session, headers: dict[str, str], conv_id: str
     ) -> list[str]:
-        deadline = time.time() + 45
+        deadline = time.time() + 120
         file_ids: list[str] = []
+        last_processing_message: str | None = None
+        last_refusal_message: str | None = None
         while time.time() < deadline:
             resp = session.get(
                 f"{self.base_url}/backend-api/conversation/{conv_id}",
@@ -428,26 +579,83 @@ class ChatgptUpstreamClient:
             )
             if resp.status_code == 200:
                 data = resp.json()
-                mapping = data.get("mapping", {})
-                for node in mapping.values():
-                    msg = node.get("message", {})
-                    if not msg:
-                        continue
-                    if msg.get("author", {}).get("role") != "tool":
-                        continue
-                    if msg.get("metadata", {}).get("async_task_type") != "image_gen":
-                        continue
-                    if msg.get("content", {}).get("content_type") != "multimodal_text":
-                        continue
-                    parts = msg.get("content", {}).get("parts", [])
-                    for part in parts:
-                        pointer = part.get("asset_pointer", "")
-                        if pointer.startswith("sediment://"):
-                            file_ids.append(pointer[11:])
+                file_ids, processing_message, refusal_message = self._extract_image_poll_state(data)
                 if file_ids:
-                    break
+                    return list(dict.fromkeys(file_ids))
+                if refusal_message:
+                    raise RuntimeError(refusal_message)
+                if processing_message:
+                    last_processing_message = processing_message
             time.sleep(3)
+        if last_refusal_message:
+            raise RuntimeError(last_refusal_message)
+        if last_processing_message:
+            raise RuntimeError(f"image generation timed out while still processing: {last_processing_message}")
         return file_ids
+
+    def _extract_image_poll_state(self, data: dict[str, Any]) -> tuple[list[str], str | None, str | None]:
+        mapping = data.get("mapping", {})
+        file_ids: list[str] = []
+        processing_message: str | None = None
+        refusal_message: str | None = None
+
+        for node in mapping.values():
+            msg = node.get("message") or {}
+            if not msg:
+                continue
+            role = msg.get("author", {}).get("role")
+            metadata = msg.get("metadata", {}) or {}
+            content = msg.get("content", {}) or {}
+            content_type = content.get("content_type")
+            parts = content.get("parts", []) if isinstance(content.get("parts"), list) else []
+
+            metadata_file_ids = metadata.get("file_ids")
+            if isinstance(metadata_file_ids, list):
+                for fid in metadata_file_ids:
+                    if isinstance(fid, str) and fid:
+                        file_ids.append(fid)
+
+            for part in parts:
+                if isinstance(part, dict):
+                    pointer = part.get("asset_pointer", "")
+                    if pointer.startswith("sediment://"):
+                        file_ids.append(pointer[11:])
+                    elif pointer.startswith("file-service://"):
+                        file_ids.append(pointer[15:])
+
+            text_parts = [part.strip() for part in parts if isinstance(part, str) and part.strip()]
+            text = "\n".join(text_parts)
+            lower_text = text.lower()
+
+            if role == "tool":
+                if metadata.get("async_task_type") == "image_gen" and file_ids:
+                    continue
+                if metadata.get("image_gen_async") or metadata.get("image_gen_task_id"):
+                    if text:
+                        processing_message = text
+                if any(keyword in lower_text for keyword in ("正在处理图片", "processing", "creating images")):
+                    processing_message = text or processing_message
+
+            if role == "assistant" and text:
+                if self._looks_like_refusal(text):
+                    refusal_message = text
+
+        return file_ids, processing_message, refusal_message
+
+    @staticmethod
+    def _extract_message_text(message: dict[str, Any]) -> str:
+        content = message.get("content", {}) or {}
+        parts = content.get("parts", []) if isinstance(content.get("parts"), list) else []
+        text_parts = [part.strip() for part in parts if isinstance(part, str) and part.strip()]
+        return "\n".join(text_parts)
+
+    @staticmethod
+    def _looks_like_refusal(text: str) -> bool:
+        lower_text = text.lower()
+        return any(keyword in text for keyword in ("无法", "不能", "抱歉", "对不起", "防护限制", "违反")) or any(
+            keyword in lower_text
+            for keyword in ("i can't", "i cannot", "sorry", "unable to", "safety policy", "policy")
+        )
 
     def _download_image(
         self,

@@ -97,32 +97,50 @@ function App() {
         setError('');
         setSuccess('');
         if (!importJson.trim()) {
-            setError('请输入 sub2api JSON');
+            setError('请输入导入 JSON');
             return;
         }
         setLoading(true);
         try {
-            const resp = await fetch(`${API_BASE}/admin/accounts/import-sub2api`, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'authorization': `Bearer ${adminToken}`
-                },
-                body: JSON.stringify({
-                    accounts_json: importJson.trim(),
-                    auto_refresh_metadata: true
-                })
-            });
+            const parsed = JSON.parse(importJson.trim());
+            let resp;
+            if (Array.isArray(parsed.accounts)) {
+                resp = await fetch(`${API_BASE}/admin/accounts/import-sub2api`, {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'authorization': `Bearer ${adminToken}`
+                    },
+                    body: JSON.stringify({
+                        accounts_json: importJson.trim(),
+                        auto_refresh_metadata: true
+                    })
+                });
+            } else if (parsed.accessToken) {
+                resp = await fetch(`${API_BASE}/admin/accounts/import`, {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'authorization': `Bearer ${adminToken}`
+                    },
+                    body: JSON.stringify({
+                        session_jsons: [importJson.trim()]
+                    })
+                });
+            } else {
+                throw new Error('仅支持 sub2api 导出 JSON 或 chatgpt.com/api/auth/session JSON');
+            }
             const data = await resp.json();
             if (resp.ok) {
-                setSuccess(`成功导入 ${data.imported_count} 个账号`);
+                const importedCount = data.imported_count ?? data.items?.length ?? 0;
+                setSuccess(`成功导入 ${importedCount} 个账号`);
                 setImportJson('');
                 fetchAccounts();
             } else {
                 setError(data.detail || '导入失败');
             }
         } catch (e) {
-            setError('导入请求失败');
+            setError(e.message || '导入请求失败');
         }
         setLoading(false);
     };
@@ -315,13 +333,13 @@ function App() {
                 <div className="card">
                     <h3 style={{ marginBottom: 16 }}>导入 sub2api 账号</h3>
                     <p style={{ color: '#888', marginBottom: 16, fontSize: '0.9rem' }}>
-                        粘贴 sub2api 导出的 JSON 内容（包含 accounts 数组）
+                        支持两种格式：sub2api 导出 JSON，或 chatgpt.com/api/auth/session 返回的 JSON
                     </p>
                     <div className="form-group">
                         <textarea
                             value={importJson}
                             onChange={(e) => setImportJson(e.target.value)}
-                            placeholder={'{\n  "accounts": [\n    {\n      "name": "...",\n      "credentials": {\n        "access_token": "...",\n        "refresh_token": "..."\n      }\n    }\n  ]\n}'}
+                            placeholder={'sub2api:\n{\n  "accounts": [ ... ]\n}\n\n或 Session JSON:\n{\n  "accessToken": "...",\n  "sessionToken": "...",\n  "user": { "email": "..." },\n  "account": { "planType": "plus" }\n}'}
                         />
                     </div>
                     <button

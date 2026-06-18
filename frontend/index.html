@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GPT2API_IIAP - Image Generator</title>
-    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <title>GPT2API_IIAP - Multimodal Console</title>
+    <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone@7.26.10/babel.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -230,9 +230,22 @@
             font-size: 0.9rem;
         }
     </style>
+    <link rel="stylesheet" href="workbench.css">
 </head>
 <body>
     <div id="root"></div>
-    <script type="text/babel" src="app.js"></script>
+    <script type="text/babel" src="src/utils/ids.js"></script>
+    <script type="text/babel" src="src/utils/storage.js"></script>
+    <script type="text/babel" src="src/utils/images.js"></script>
+    <script type="text/babel" src="src/api/imageResponse.js"></script>
+    <script type="text/babel" src="src/api/localGatewayClient.js"></script>
+    <script type="text/babel" src="src/api/sub2apiClient.js"></script>
+    <script type="text/babel" src="src/state/workspaceState.js"></script>
+    <script type="text/babel" src="src/components/WindowSidebar.js"></script>
+    <script type="text/babel" src="src/components/MessageList.js"></script>
+    <script type="text/babel" src="src/components/ComposerPanel.js"></script>
+    <script type="text/babel" src="src/components/SourceSettings.js"></script>
+    <script type="text/babel" src="src/components/ModalityTabs.js"></script>
+    <script type="text/babel" src="src/App.js"></script>
 </body>
 </html>

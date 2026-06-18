@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import time
 import uuid
 from typing import Any
@@ -59,6 +60,8 @@ class AppService:
         self.upstream = upstream
         self.key_scheduler = LocalRequestScheduler()
         self.account_scheduler = LocalRequestScheduler()
+        self._account_retry_after: dict[str, float] = {}
+        self._account_failure_streaks: dict[str, int] = {}
         self._ensure_default_api_key()
 
     def _ensure_default_api_key(self) -> None:
@@ -162,7 +165,7 @@ class AppService:
                 email=email,
                 plan_type=plan_type,
                 status="active",
-                request_max_concurrency=2,
+                request_max_concurrency=1,
                 browser_profile_json="{}",
             )
             self.storage.upsert_account(account)
@@ -438,7 +441,7 @@ class AppService:
                 last_routed_at_ms=a.last_used_at or 0,
             )
             for a in accounts
-            if is_account_selectable(a)
+            if is_account_selectable(a) and not self._is_account_in_backoff(a.name)
         ]
         selected = select_best_candidate(RouteStrategy.AUTO, candidates)
         if selected is None:
@@ -456,9 +459,10 @@ class AppService:
             remaining = {
                 a.name: a
                 for a in accounts
-                if is_account_selectable(a)
+                if is_account_selectable(a) and not self._is_account_in_backoff(a.name)
             }
-            if not remaining:
+            backoff_wait_ms = self._next_account_backoff_wait_ms(accounts)
+            if not remaining and backoff_wait_ms <= 0:
                 raise RuntimeError("no available accounts")
 
             waits: list[int] = []
@@ -483,27 +487,74 @@ class AppService:
                 account = remaining.pop(selected.name)
                 lease = self.account_scheduler.try_acquire(
                     f"account:{account.name}",
-                    account.request_max_concurrency,
+                    effective_account_max_concurrency(account),
                     account.request_min_start_interval_ms,
                 )
                 if isinstance(lease, Lease):
                     return account, lease
                 waits.append(lease.wait_ms)
 
-            wait = min(waits) if waits else 0
-            await self.account_scheduler.wait_for_available(wait)
+            wait = min(waits) if waits else backoff_wait_ms
+            await self._wait_for_account_availability(wait)
+
+    async def acquire_best_account_for_queue(self) -> tuple[AccountRecord, Lease]:
+        """Pick the best currently available account for anonymous queued jobs."""
+        while True:
+            accounts = self.storage.list_accounts()
+            available = [
+                a
+                for a in accounts
+                if is_account_selectable(a) and not self._is_account_in_backoff(a.name)
+            ]
+            backoff_wait_ms = self._next_account_backoff_wait_ms(accounts)
+            if not available and backoff_wait_ms <= 0:
+                raise RuntimeError("no available accounts")
+
+            candidates = [
+                AccountRouteCandidate(
+                    name=a.name,
+                    quota_remaining=a.quota_remaining,
+                    quota_known=a.quota_known,
+                    last_routed_at_ms=a.last_used_at or 0,
+                )
+                for a in available
+            ]
+            selected = select_best_candidate(RouteStrategy.AUTO, candidates)
+            if selected is None:
+                await self._wait_for_account_availability(backoff_wait_ms)
+                continue
+
+            account = next(a for a in available if a.name == selected.name)
+            lease = self.account_scheduler.try_acquire(
+                f"account:{account.name}",
+                effective_account_max_concurrency(account),
+                account.request_min_start_interval_ms,
+            )
+            if isinstance(lease, Lease):
+                return account, lease
+
+            wait = lease.wait_ms
+            if backoff_wait_ms > 0:
+                wait = min(wait, backoff_wait_ms) if wait > 0 else backoff_wait_ms
+            await self._wait_for_account_availability(wait)
 
     async def _acquire_account_lease(self, account: AccountRecord) -> Lease:
         """Acquire lease for a specific account, waiting if needed."""
         while True:
             lease = self.account_scheduler.try_acquire(
                 f"account:{account.name}",
-                account.request_max_concurrency,
+                effective_account_max_concurrency(account),
                 account.request_min_start_interval_ms,
             )
             if isinstance(lease, Lease):
                 return lease
-            await self.account_scheduler.wait_for_available(lease.wait_ms)
+            await self._wait_for_account_availability(lease.wait_ms)
+
+    async def _wait_for_account_availability(self, wait_ms: int) -> None:
+        if wait_ms > 0:
+            await asyncio.sleep(wait_ms / 1000.0)
+            return
+        await self.account_scheduler.wait_for_available(wait_ms)
 
     # ------------------------------------------------------------------ #
     # Account refresh
@@ -551,6 +602,8 @@ class AppService:
         account.success_count += 1
         account.last_used_at = int(time.time())
         account.last_error = None
+        self._account_failure_streaks.pop(account.name, None)
+        self._account_retry_after.pop(account.name, None)
         if account.quota_known:
             account.quota_remaining = max(0, account.quota_remaining - 1)
             account.status = "limited" if account.quota_remaining == 0 else "active"
@@ -566,7 +619,30 @@ class AppService:
             account.status = "invalid"
             account.quota_remaining = 0
             account.quota_known = True
+            self._account_failure_streaks.pop(account.name, None)
+            self._account_retry_after.pop(account.name, None)
+        elif should_backoff_account_error(error_message):
+            streak = self._account_failure_streaks.get(account.name, 0) + 1
+            self._account_failure_streaks[account.name] = streak
+            self._account_retry_after[account.name] = time.monotonic() + account_backoff_seconds(streak, error_message)
         self.storage.upsert_account(account)
+
+    def _is_account_in_backoff(self, account_name: str) -> bool:
+        retry_after = self._account_retry_after.get(account_name)
+        if retry_after is None:
+            return False
+        if time.monotonic() >= retry_after:
+            self._account_retry_after.pop(account_name, None)
+            return False
+        return True
+
+    def _next_account_backoff_wait_ms(self, accounts: list[AccountRecord]) -> int:
+        waits = [
+            max(0, int((retry_after - time.monotonic()) * 1000))
+            for account_name, retry_after in self._account_retry_after.items()
+            if any(a.name == account_name and is_account_selectable(a) for a in accounts)
+        ]
+        return min(waits) if waits else 0
 
 
 # ------------------------------------------------------------------ #
@@ -630,6 +706,10 @@ def is_account_routeable(account: AccountRecord) -> bool:
     return account.status == "active"
 
 
+def effective_account_max_concurrency(account: AccountRecord) -> int:
+    return 1
+
+
 def is_token_invalid_error(message: str) -> bool:
     text = message.lower()
     return any(
@@ -642,3 +722,65 @@ def is_token_invalid_error(message: str) -> bool:
             "/backend-api/me failed: http 401",
         )
     )
+
+
+def should_backoff_account_error(message: str) -> bool:
+    text = message.lower()
+    if is_token_invalid_error(text):
+        return False
+    if "no file ids found after polling" in text:
+        return False
+    if is_prompt_rejection_error(text):
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            "timed out",
+            "timeout",
+            "http/2 stream",
+            "internal_error",
+            "failed to perform",
+            "connection",
+            "connect",
+            "proxy",
+            "502",
+            "503",
+            "504",
+            "429",
+            "rate limit",
+            "quota_exhausted",
+        )
+    )
+
+
+def is_prompt_rejection_error(message: str) -> bool:
+    text = message.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "该提示可能违反",
+            "防护限制",
+            "修改提示语",
+            "违反了",
+            "违反我们的政策",
+            "非常抱歉",
+            "sorry, this prompt",
+            "may violate",
+            "safety policy",
+            "policy",
+            "cannot help with that request",
+            "can't help with that request",
+            "unable to generate",
+        )
+    )
+
+
+def account_backoff_seconds(streak: int, message: str) -> int:
+    text = message.lower()
+    if "429" in text or "rate limit" in text:
+        base = 60
+    elif "timed out" in text or "timeout" in text:
+        base = 45
+    else:
+        base = 30
+    return min(300, base * max(1, min(streak, 4)))

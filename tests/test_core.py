@@ -96,15 +96,37 @@ class TestImageEditMultipart:
         assert response.status_code == 400
         assert "image" in response.json()["detail"].lower()
 
-    def test_edit_with_image_upstream_not_ready(self, client: TestClient) -> None:
+    def test_edit_with_image_delegates_to_upstream(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        import base64
+        from app.models import ChatgptImageResult, GeneratedImageItem
+        import time as _time
+
+        fake_result = ChatgptImageResult(
+            created=int(_time.time()),
+            data=[GeneratedImageItem(b64_json=base64.b64encode(b"fake-image").decode(), revised_prompt="hello")],
+            resolved_model="gpt-image-1",
+        )
+
+        async def fake_edit_image(account, prompt, model, image_data, file_name, mime_type):
+            assert image_data == b"fake-image-bytes"
+            assert file_name == "cat.png"
+            assert mime_type == "image/png"
+            return fake_result
+
+        from app.main import app as _app
+        monkeypatch.setattr(_app.state.service.upstream, "edit_image", fake_edit_image)
+
         response = client.post(
             "/v1/images/edits",
             headers={"authorization": f"Bearer {settings.admin_token}"},
             data={"prompt": "hello", "model": "gpt-image-1", "n": "1"},
             files={"image": ("cat.png", b"fake-image-bytes", "image/png")},
         )
-        # upstream is NotImplementedError -> mapped to 502
-        assert response.status_code == 502
+        assert response.status_code == 200
+        data = response.json()
+        assert "data" in data
+        assert len(data["data"]) == 1
+        assert "b64_json" in data["data"][0]
 
 
 class TestSchedulerLease:
@@ -247,8 +269,30 @@ class TestAccountImport:
         )
         assert response.status_code == 200
         data = response.json()
-        assert len(data["items"]) == 1
-        assert data["items"][0]["access_token"] == "test-token-123"
+        assert any(item["access_token"] == "test-token-123" for item in data["items"])
+
+    def test_import_session_json(self, client: TestClient) -> None:
+        session_json = {
+            "user": {
+                "id": "user-demo",
+                "email": "demo@example.com",
+            },
+            "account": {
+                "planType": "plus",
+            },
+            "accessToken": "session-access-token-123",
+            "sessionToken": "session-cookie-456",
+        }
+        response = client.post(
+            "/admin/accounts/import",
+            headers={"authorization": f"Bearer {settings.admin_token}"},
+            json={"session_jsons": [__import__("json").dumps(session_json)]},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        item = next(i for i in data["items"] if i["access_token"] == "session-access-token-123")
+        assert item["email"] == "demo@example.com"
+        assert item["plan_type"] == "plus"
 
     def test_import_empty(self, client: TestClient) -> None:
         response = client.post(
@@ -257,3 +301,237 @@ class TestAccountImport:
             json={},
         )
         assert response.status_code == 400
+
+
+class TestAccountSchedulerBackoff:
+    """Transient account failures should temporarily remove bad accounts from routing."""
+
+    def test_timeout_failure_puts_account_into_backoff(self, tmp_path) -> None:
+        from app.models import AccountRecord
+        from app.service import AppService
+        from storage.control import ControlDb
+
+        class DummyUpstream:
+            pass
+
+        db = ControlDb(tmp_path / "control.db")
+        service = AppService(storage=db, admin_token="change-me", upstream=DummyUpstream())
+        bad = AccountRecord(name="bad", access_token="bad-token", status="active", quota_remaining=10, quota_known=True)
+        good = AccountRecord(name="good", access_token="good-token", status="active", quota_remaining=5, quota_known=True)
+        db.upsert_account(bad)
+        db.upsert_account(good)
+
+        service._record_account_failure(bad, "operation timed out while connecting upstream")
+
+        selected = service.select_best_account()
+        assert selected is not None
+        assert selected.name == "good"
+
+    def test_prompt_refusal_does_not_put_account_into_backoff(self, tmp_path) -> None:
+        from app.models import AccountRecord
+        from app.service import AppService
+        from storage.control import ControlDb
+
+        class DummyUpstream:
+            pass
+
+        db = ControlDb(tmp_path / "control.db")
+        service = AppService(storage=db, admin_token="change-me", upstream=DummyUpstream())
+        only = AccountRecord(name="only", access_token="only-token", status="active", quota_remaining=10, quota_known=True)
+        db.upsert_account(only)
+
+        service._record_account_failure(only, "no file IDs found after polling")
+
+        selected = service.select_best_account()
+        assert selected is not None
+        assert selected.name == "only"
+
+
+class TestQueuePartialSuccess:
+    """One failed image in a batch should not discard successful images."""
+
+    def test_batch_generates_images_serially_within_one_job(self, tmp_path) -> None:
+        import asyncio
+
+        from app.models import AccountRecord, ChatgptImageResult, GeneratedImageItem
+        from app.queue_manager import GenerationJob, QueueManager
+        from storage.control import ControlDb
+
+        class DummyLease:
+            def release(self) -> None:
+                return None
+
+        class DummyUpstream:
+            def __init__(self) -> None:
+                self.active = 0
+                self.max_active = 0
+
+            async def generate_image(self, account, prompt, model):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await asyncio.sleep(0.01)
+                self.active -= 1
+                return ChatgptImageResult(
+                    created=1,
+                    data=[GeneratedImageItem(b64_json="ZmFrZQ==", revised_prompt=prompt)],
+                    resolved_model=model,
+                )
+
+        class DummyService:
+            def __init__(self, storage, upstream):
+                self.storage = storage
+                self.upstream = upstream
+
+            async def acquire_best_account_for_queue(self):
+                return self.storage.list_accounts()[0], DummyLease()
+
+            async def _refresh_account_if_needed(self, account):
+                return account
+
+            def _record_account_success(self, account):
+                return None
+
+            def _record_account_failure(self, account, error_message):
+                return None
+
+        async def run_test():
+            db = ControlDb(tmp_path / "control.db")
+            upstream = DummyUpstream()
+            db.upsert_account(
+                AccountRecord(
+                    name="demo",
+                    access_token="token",
+                    status="active",
+                    quota_remaining=10,
+                    quota_known=True,
+                )
+            )
+            queue = QueueManager(DummyService(db, upstream), workers=1)
+            result = await queue._execute_job(GenerationJob(prompt="hello", model="gpt-image-2", n=2))
+            assert len(result["data"]) == 2
+            assert upstream.max_active == 1
+
+        asyncio.run(run_test())
+
+    def test_worker_classifies_prompt_refusal_error(self, tmp_path) -> None:
+        import asyncio
+
+        from app.models import AccountRecord
+        from app.queue_manager import GenerationJob, QueueManager
+        from storage.control import ControlDb
+
+        refusal = "非常抱歉，生成的图片可能违反了关于轻度性暗示或挑逗性主题的防护限制。"
+
+        class DummyLease:
+            def release(self) -> None:
+                return None
+
+        class DummyUpstream:
+            async def generate_image(self, account, prompt, model):
+                raise RuntimeError(refusal)
+
+        class DummyService:
+            def __init__(self, storage):
+                self.storage = storage
+                self.upstream = DummyUpstream()
+
+            async def acquire_best_account_for_queue(self):
+                return self.storage.list_accounts()[0], DummyLease()
+
+            async def _refresh_account_if_needed(self, account):
+                return account
+
+            def _record_account_success(self, account):
+                return None
+
+            def _record_account_failure(self, account, error_message):
+                return None
+
+        async def run_test():
+            db = ControlDb(tmp_path / "control.db")
+            db.upsert_account(
+                AccountRecord(
+                    name="demo",
+                    access_token="token",
+                    status="active",
+                    quota_remaining=10,
+                    quota_known=True,
+                )
+            )
+            queue = QueueManager(DummyService(db), workers=1)
+            await queue.submit(GenerationJob(prompt="hello", model="gpt-image-2", n=1, request_id="req-refusal"))
+            worker = asyncio.create_task(queue._worker_loop())
+            await asyncio.wait_for(queue._queue.join(), timeout=1)
+            worker.cancel()
+            result = queue.get_result("req-refusal")
+            assert result is not None
+            assert result["status"] == "error"
+            assert result["error_type"] == "prompt_rejection"
+            assert result["upstream_message"] == refusal
+
+        asyncio.run(run_test())
+
+    def test_batch_returns_partial_success_when_one_image_fails(self, tmp_path) -> None:
+        import asyncio
+
+        from app.models import AccountRecord, ChatgptImageResult, GeneratedImageItem
+        from app.queue_manager import GenerationJob, QueueManager
+        from storage.control import ControlDb
+
+        class DummyLease:
+            def release(self) -> None:
+                return None
+
+        class DummyUpstream:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.lock = asyncio.Lock()
+
+            async def generate_image(self, account, prompt, model):
+                async with self.lock:
+                    self.calls += 1
+                    call_no = self.calls
+                await asyncio.sleep(0.01)
+                if call_no == 1:
+                    raise RuntimeError("synthetic single-image failure")
+                return ChatgptImageResult(
+                    created=1,
+                    data=[GeneratedImageItem(b64_json="ZmFrZQ==", revised_prompt=prompt)],
+                    resolved_model=model,
+                )
+
+        class DummyService:
+            def __init__(self, storage, upstream):
+                self.storage = storage
+                self.upstream = upstream
+
+            async def acquire_best_account_for_queue(self):
+                return self.storage.list_accounts()[0], DummyLease()
+
+            async def _refresh_account_if_needed(self, account):
+                return account
+
+            def _record_account_success(self, account):
+                return None
+
+            def _record_account_failure(self, account, error_message):
+                return None
+
+        async def run_test():
+            db = ControlDb(tmp_path / "control.db")
+            db.upsert_account(
+                AccountRecord(
+                    name="demo",
+                    access_token="token",
+                    status="active",
+                    quota_remaining=10,
+                    quota_known=True,
+                )
+            )
+            service = DummyService(db, DummyUpstream())
+            queue = QueueManager(service, workers=1)
+            result = await queue._execute_job(GenerationJob(prompt="hello", model="gpt-image-2", n=2))
+            assert len(result["data"]) == 1
+            assert result["partial_error"] == "synthetic single-image failure"
+
+        asyncio.run(run_test())

@@ -18,11 +18,17 @@ class ImportedAccountSeed:
         access_token: str,
         source_kind: AccountSourceKind,
         browser_profile: BrowserProfile,
+        email: str | None = None,
+        user_id: str | None = None,
+        plan_type: str | None = None,
     ) -> None:
         self.name = name
         self.access_token = access_token
         self.source_kind = source_kind
         self.browser_profile = browser_profile
+        self.email = email
+        self.user_id = user_id
+        self.plan_type = plan_type
 
 
 def derive_account_name(access_token: str) -> str:
@@ -59,11 +65,32 @@ def parse_session_seed(raw: str) -> ImportedAccountSeed:
         user_agent=None,
         impersonate_browser="edge",
     )
+    user = value.get("user") or {}
+    account = value.get("account") or {}
+    email = user.get("email")
+    if not isinstance(email, str) or not email.strip():
+        email = None
+    else:
+        email = email.strip()
+    user_id = user.get("id")
+    if not isinstance(user_id, str) or not user_id.strip():
+        user_id = None
+    else:
+        user_id = user_id.strip()
+    plan_type = account.get("planType")
+    if not isinstance(plan_type, str) or not plan_type.strip():
+        plan_type = None
+    else:
+        plan_type = plan_type.strip()
+    name = email or derive_account_name(access_token)
     return ImportedAccountSeed(
-        name=derive_account_name(access_token),
+        name=name,
         access_token=access_token,
         source_kind=AccountSourceKind.SESSION_JSON,
         browser_profile=browser_profile,
+        email=email,
+        user_id=user_id,
+        plan_type=plan_type,
     )
 
 
@@ -73,7 +100,10 @@ def build_account_record(seed: ImportedAccountSeed) -> AccountRecord:
         name=seed.name,
         access_token=seed.access_token,
         source_kind=seed.source_kind,
+        email=seed.email,
+        user_id=seed.user_id,
+        plan_type=seed.plan_type,
         status="active",
-        request_max_concurrency=2,
+        request_max_concurrency=1,
         browser_profile_json=seed.browser_profile.model_dump_json(),
     )

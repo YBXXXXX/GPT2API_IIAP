@@ -4,9 +4,12 @@ const API_BASE = window.location.origin;
 
 function App() {
     const [prompt, setPrompt] = useState('');
-    const [model, setModel] = useState('gpt-image-1');
     const [n, setN] = useState(1);
     const [loading, setLoading] = useState(false);
+    const [jobStatus, setJobStatus] = useState('idle');
+    const [completedCount, setCompletedCount] = useState(0);
+    const [requestedCount, setRequestedCount] = useState(1);
+    const [jobMessage, setJobMessage] = useState('');
     const [error, setError] = useState('');
     const [results, setResults] = useState([]);
     const [apiStatus, setApiStatus] = useState('checking');
@@ -15,11 +18,93 @@ function App() {
     const [queuePosition, setQueuePosition] = useState(-1);
     const pollRef = useRef(null);
 
+    const applyQueuePayload = useCallback((data) => {
+        if (data.status === 'done') {
+            setLoading(false);
+            setJobStatus('idle');
+            setCompletedCount(data.completed || data.data?.data?.length || 0);
+            setRequestedCount(data.requested_n || n);
+            setJobMessage('');
+            setQueuePosition(-1);
+            const images = data.data?.data || [];
+            setResults(images.map((img, idx) => ({
+                id: `${idx}-${img.b64_json.slice(0, 16)}`,
+                b64_json: img.b64_json,
+                revised_prompt: img.revised_prompt || prompt,
+                index: idx,
+            })));
+            sessionStorage.removeItem('gpt2api_active_request');
+            return 'done';
+        }
+
+        if (data.status === 'error') {
+            setLoading(false);
+            setJobStatus('idle');
+            setCompletedCount(0);
+            setJobMessage('');
+            setQueuePosition(-1);
+            setError(data.detail || '生成失败');
+            sessionStorage.removeItem('gpt2api_active_request');
+            return 'error';
+        }
+
+        if (data.status === 'processing') {
+            setJobStatus('processing');
+            setCompletedCount(data.completed || 0);
+            setRequestedCount(data.requested_n || n);
+            setJobMessage(data.message || '正在生成图片');
+            setQueuePosition(-1);
+            const images = data.data?.data || [];
+            if (images.length > 0) {
+                setResults(images.map((img, idx) => ({
+                    id: `${idx}-${img.b64_json.slice(0, 16)}`,
+                    b64_json: img.b64_json,
+                    revised_prompt: img.revised_prompt || prompt,
+                    index: idx,
+                })));
+            }
+            return 'processing';
+        }
+
+        if (data.status === 'queued') {
+            setJobStatus('queued');
+            setCompletedCount(0);
+            setRequestedCount(n);
+            setJobMessage('');
+            setQueuePosition(data.position >= 0 ? data.position : 0);
+            return 'queued';
+        }
+
+        if (data.status === 'not_found') {
+            setLoading(false);
+            setJobStatus('idle');
+            setCompletedCount(0);
+            setJobMessage('');
+            setError('任务不存在或已过期');
+            sessionStorage.removeItem('gpt2api_active_request');
+            return 'not_found';
+        }
+
+        return 'unknown';
+    }, [n, prompt]);
+
+    const pollOnce = useCallback(async (requestId) => {
+        const resp = await fetch(`${API_BASE}/v1/queue/result/${requestId}`);
+        const data = await resp.json();
+        return applyQueuePayload(data);
+    }, [applyQueuePayload]);
+
     // Load API status and queue status
     useEffect(() => {
         fetch(`${API_BASE}/healthz`)
             .then(r => r.ok ? setApiStatus('online') : setApiStatus('offline'))
             .catch(() => setApiStatus('offline'));
+
+        const activeRequestId = sessionStorage.getItem('gpt2api_active_request');
+        if (activeRequestId) {
+            setLoading(true);
+            setPollRequestId(activeRequestId);
+        }
 
         const interval = setInterval(() => {
             fetch(`${API_BASE}/v1/queue/status`)
@@ -34,33 +119,34 @@ function App() {
     useEffect(() => {
         if (!pollRequestId) return;
 
+        pollOnce(pollRequestId).then((state) => {
+            if (state === 'done' || state === 'error' || state === 'not_found') {
+                if (pollRef.current) {
+                    clearInterval(pollRef.current);
+                    pollRef.current = null;
+                }
+            }
+        }).catch((err) => {
+            setError(err.message);
+            setLoading(false);
+            setJobStatus('idle');
+        });
+
         pollRef.current = setInterval(async () => {
             try {
-                const resp = await fetch(`${API_BASE}/v1/queue/result/${pollRequestId}`);
-                const data = await resp.json();
-                if (data.status === 'done') {
+                const state = await pollOnce(pollRequestId);
+                if (state === 'done' || state === 'error' || state === 'not_found') {
                     clearInterval(pollRef.current);
-                    setLoading(false);
-                    setQueuePosition(-1);
-                    const images = data.data?.data || [];
-                    setResults(images.map((img, idx) => ({
-                        id: `${Date.now()}-${idx}`,
-                        b64_json: img.b64_json,
-                        revised_prompt: img.revised_prompt || prompt,
-                        index: idx,
-                    })));
-                } else if (data.status === 'error') {
-                    clearInterval(pollRef.current);
-                    setLoading(false);
-                    setQueuePosition(-1);
-                    setError(data.detail || '生成失败');
-                } else {
-                    setQueuePosition(data.position >= 0 ? data.position : 0);
+                    pollRef.current = null;
                 }
             } catch (err) {
                 setError(err.message);
                 clearInterval(pollRef.current);
+                pollRef.current = null;
                 setLoading(false);
+                setJobStatus('idle');
+                setCompletedCount(0);
+                setJobMessage('');
             }
         }, 1500);
 
@@ -73,9 +159,19 @@ function App() {
             return;
         }
 
+        if (pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+        }
+
         setLoading(true);
+        setJobStatus('queued');
+        setCompletedCount(0);
+        setRequestedCount(parseInt(n));
+        setJobMessage('');
         setError('');
         setResults([]);
+        setPollRequestId(null);
         setQueuePosition(-1);
 
         try {
@@ -84,22 +180,31 @@ function App() {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ prompt, model, n: parseInt(n) }),
+                body: JSON.stringify({ prompt, model: 'gpt-image-2', n: parseInt(n) }),
             });
             const data = await resp.json();
             if (!resp.ok) {
                 throw new Error(data.detail || `HTTP ${resp.status}`);
             }
+            sessionStorage.setItem('gpt2api_active_request', data.request_id);
             setPollRequestId(data.request_id);
         } catch (err) {
             setError(err.message || '提交失败');
             setLoading(false);
         }
-    }, [prompt, model, n, apiKey]);
+    }, [prompt, n]);
 
     const clearResults = () => {
+        if (pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+        }
         setResults([]);
         setError('');
+        setJobStatus('idle');
+        setCompletedCount(0);
+        setJobMessage('');
+        sessionStorage.removeItem('gpt2api_active_request');
         setPollRequestId(null);
         setQueuePosition(-1);
     };
@@ -150,11 +255,7 @@ function App() {
                 <div className="row">
                     <div className="form-group">
                         <label>Model</label>
-                        <select value={model} onChange={(e) => setModel(e.target.value)}>
-                            <option value="gpt-image-1">gpt-image-1</option>
-                            <option value="gpt-image-2">gpt-image-2</option>
-                            <option value="auto">auto</option>
-                        </select>
+                        <input type="text" value="gpt-image-2" readOnly />
                     </div>
                     <div className="form-group">
                         <label>数量 (n)</label>
@@ -187,9 +288,15 @@ function App() {
                     )}
                 </div>
 
-                {loading && queuePosition >= 0 && (
+                {loading && jobStatus === 'queued' && queuePosition >= 0 && (
                     <div className="info" style={{ marginTop: 12 }}>
                         当前排队位置: #{queuePosition + 1}
+                    </div>
+                )}
+
+                {loading && jobStatus === 'processing' && (
+                    <div className="info" style={{ marginTop: 12 }}>
+                        {jobMessage || `正在生成第 ${Math.min(requestedCount, completedCount + 1)} 张，共 ${requestedCount} 张`}
                     </div>
                 )}
 
@@ -200,7 +307,9 @@ function App() {
                 <div className="card loading-overlay">
                     <div className="spinner"></div>
                     <p style={{ color: '#888' }}>
-                        {queuePosition >= 0 ? `排队中 (#${queuePosition + 1})...` : '正在生成图片，请稍候...'}
+                        {jobStatus === 'queued'
+                            ? `排队中 (#${queuePosition + 1})...`
+                            : (jobMessage || `正在生成第 ${Math.min(requestedCount, completedCount + 1)} 张，共 ${requestedCount} 张...`)}
                     </p>
                 </div>
             )}

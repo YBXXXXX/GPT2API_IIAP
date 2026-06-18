@@ -16,7 +16,7 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-PYTHON_VERSION=$(python3 --version | grep -oP '\d+\.\d+' | head -1)
+PYTHON_VERSION=$(python3 --version | sed -E 's/.* ([0-9]+\.[0-9]+).*/\1/')
 echo "Python 版本: $PYTHON_VERSION"
 
 # 检查虚拟环境
@@ -62,7 +62,7 @@ echo ""
 echo "启动 GPT2API_IIAP 服务..."
 echo "访问地址: http://127.0.0.1:$PORT"
 echo "前端页面: http://127.0.0.1:$PORT/ui"
-echo "管理面板: http://127.0.0.1:$PORT/admin"
+echo "管理面板: http://127.0.0.1:$PORT/panel"
 echo "日志文件: logs/server.log"
 echo "======================================"
 

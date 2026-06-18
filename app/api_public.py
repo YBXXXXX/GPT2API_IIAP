@@ -103,10 +103,14 @@ async def queue_result(request_id: str, request: Request) -> dict[str, Any]:
     """Poll for result of a queued generation request."""
     queue = request.app.state.queue
     result = queue.get_result(request_id)
-    if result is None:
-        position = queue.get_position(request_id)
-        return {"status": "pending", "position": position}
-    return result
+    if result is not None:
+        return result
+    if queue.is_processing(request_id):
+        return {"status": "processing"}
+    position = queue.get_position(request_id)
+    if position >= 0:
+        return {"status": "queued", "position": position}
+    return {"status": "not_found", "detail": "request not found"}
 
 
 # ------------------------------------------------------------------ #
