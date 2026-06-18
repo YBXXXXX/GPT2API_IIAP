@@ -79,8 +79,11 @@ def test_frontend_components_do_not_own_transport_or_storage() -> None:
 
 def test_frontend_builds_direct_sub2api_image_request() -> None:
     source = read_frontend()
+    sub2api_client = frontend_path("src/api/sub2apiClient.js").read_text()
+    local_client = frontend_path("src/api/localGatewayClient.js").read_text()
 
-    assert "/v1/images/generations" in source
+    assert "/v1/images/generations" in sub2api_client
+    assert "/v1/queue/generations" in local_client
     assert "Authorization" in source
     assert "Bearer ${token}" in source
     assert "normalizeImageResponse" in source

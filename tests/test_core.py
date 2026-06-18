@@ -84,6 +84,58 @@ class TestPublicAuth:
         assert data["object"] == "list"
 
 
+class TestImageGenerationEndpoint:
+    """/v1/images/generations must behave like the official synchronous endpoint."""
+
+    def test_generation_requires_auth(self, client: TestClient) -> None:
+        response = client.post(
+            "/v1/images/generations",
+            json={"prompt": "hello", "model": "gpt-image-1", "n": 1},
+        )
+        assert response.status_code == 401
+
+    def test_generation_returns_image_json(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        import base64
+        import time as _time
+        from app.models import ChatgptImageResult, GeneratedImageItem
+
+        fake_result = ChatgptImageResult(
+            created=int(_time.time()),
+            data=[GeneratedImageItem(b64_json=base64.b64encode(b"fake-image").decode(), revised_prompt="hello")],
+            resolved_model="gpt-image-1",
+        )
+
+        async def fake_generate_images_for_key(key, prompt, model, n):
+            assert prompt == "hello"
+            assert model == "gpt-image-1"
+            assert n == 1
+            return fake_result
+
+        from app.main import app as _app
+        monkeypatch.setattr(_app.state.service, "generate_images_for_key", fake_generate_images_for_key)
+
+        response = client.post(
+            "/v1/images/generations",
+            headers={"authorization": f"Bearer {settings.admin_token}"},
+            json={"prompt": "hello", "model": "gpt-image-1", "n": 1},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "request_id" not in data
+        assert "created" in data
+        assert data["data"][0]["b64_json"] == base64.b64encode(b"fake-image").decode()
+
+    def test_queue_generation_keeps_async_contract(self, client: TestClient) -> None:
+        response = client.post(
+            "/v1/queue/generations",
+            json={"prompt": "hello", "model": "gpt-image-1", "n": 1},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "queued"
+        assert "request_id" in data
+
+
 class TestImageEditMultipart:
     """/v1/images/edits must accept OpenAI-compatible multipart form data."""
 

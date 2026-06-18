@@ -114,17 +114,16 @@ async def queue_result(request_id: str, request: Request) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------ #
-# Image generation (queued)
+# Image generation
 # ------------------------------------------------------------------ #
 
-@router.post("/v1/images/generations")
-async def generate_images(
+@router.post("/v1/queue/generations")
+async def queue_image_generation(
     request: Request,
     body: ImageGenerationRequest,
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     service: AppService = request.app.state.service
-    # Optional API key auth: validate & deduct quota if provided, otherwise allow anonymous
     if authorization:
         key = await authenticate_key(service, authorization)
         ensure_key_can_consume(key, body.n)
@@ -137,6 +136,26 @@ async def generate_images(
     )
     request_id = await queue.submit(job)
     return {"request_id": request_id, "status": "queued"}
+
+
+@router.post("/v1/images/generations")
+async def generate_images(
+    request: Request,
+    body: ImageGenerationRequest,
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    service: AppService = request.app.state.service
+    key = await authenticate_key(service, authorization)
+    try:
+        result = await service.generate_images_for_key(
+            key,
+            body.prompt.strip(),
+            body.model.strip(),
+            max(1, min(body.n, 4)),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return _image_result_to_json(result)
 
 
 @router.post("/v1/images/edits")

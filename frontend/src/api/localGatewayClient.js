@@ -14,7 +14,7 @@ window.GPT2API.api.getQueueStatus = async function getQueueStatus() {
 };
 
 window.GPT2API.api.submitLocalImageGeneration = async function submitLocalImageGeneration({ prompt, model, n }) {
-    const response = await fetch(`${window.GPT2API.api.API_BASE}/v1/images/generations`, {
+    const response = await fetch(`${window.GPT2API.api.API_BASE}/v1/queue/generations`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, model, n }),
